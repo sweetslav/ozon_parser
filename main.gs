@@ -1,5 +1,5 @@
 // ============================================================
-// OZON ETL v1.0 - ПОЛНЫЙ КОД ДЛЯ БЫСТРОГО СТАРТА
+// OZON ETL v1.2 - ФИНАЛЬНЫЙ (FBS ПО ДНЯМ + ПРАВИЛЬНЫЙ КЭШ)
 // ============================================================
 
 // ============================================================
@@ -15,7 +15,7 @@ const OZON_CONFIG = {
     finance: '/v3/finance/transaction/list',
     productInfo: '/v3/product/info/list'
   },
-  pagination: { limit: 100, maxLimit: 1000 },
+  pagination: { limit: 100, maxLimit: 100 },
   delays: { betweenPages: 500, betweenApis: 1000, afterError: 2000, maxRetries: 3 },
   cache: { ttl: 3600, prefix: 'OZON' }
 };
@@ -65,7 +65,7 @@ class OzonSecrets {
 }
 
 // ============================================================
-// 3. КЭШ-МЕНЕДЖЕР
+// 3. КЭШ-МЕНЕДЖЕР (ИСПРАВЛЕН)
 // ============================================================
 
 class OzonCache {
@@ -75,12 +75,30 @@ class OzonCache {
     this.prefix = 'OZON';
   }
   
+  /**
+   * Генерирует уникальный ключ кэша через хеширование JSON
+   * ИСПРАВЛЕНО: раньше "[object Object]" ломал ключи для вложенных объектов
+   */
   key(endpoint, params) {
-    const sorted = Object.keys(params)
-      .sort()
-      .map(k => `${k}=${params[k]}`)
-      .join('&');
-    return `${this.prefix}:${endpoint}:${sorted}`.substring(0, 250);
+    try {
+      // Полная сериализация вложенных объектов
+      const sorted = JSON.stringify(params, Object.keys(params).sort());
+      const hash = this._simpleHash(sorted);
+      return `${this.prefix}:${endpoint}:${hash}`.substring(0, 250);
+    } catch (e) {
+      // Фолбэк на случай ошибки сериализации
+      return `${this.prefix}:${endpoint}:${Date.now()}`;
+    }
+  }
+  
+  _simpleHash(str) {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash;
+    }
+    return Math.abs(hash).toString(36);
   }
   
   get(key) {
@@ -89,18 +107,26 @@ class OzonCache {
     try { return JSON.parse(cached); } catch (e) { return null; }
   }
   
+  /**
+   * Сохраняет данные в кэш с проверкой размера
+   * CacheService имеет лимит 100KB на запись
+   */
   set(key, data) {
-    this.cache.put(key, JSON.stringify(data), this.ttl);
-  }
-  
-  clear() {
-    // CacheService не поддерживает удаление по префиксу
-    // Используем TTL для автоматической очистки
+    try {
+      const serialized = JSON.stringify(data);
+      if (serialized.length > 100000) {
+        Logger.log(`⚠️ Данные слишком большие для кэша: ${serialized.length} байт`);
+        return;
+      }
+      this.cache.put(key, serialized, this.ttl);
+    } catch (e) {
+      Logger.log(`⚠️ Ошибка кэширования: ${e.message}`);
+    }
   }
 }
 
 // ============================================================
-// 4. API КЛИЕНТ
+// 4. API КЛИЕНТ (С ЛОГИРОВАНИЕМ РАЗМЕРА)
 // ============================================================
 
 class OzonClient {
@@ -113,18 +139,10 @@ class OzonClient {
     this.rateLimit = 50;
   }
   
-  /**
-   * Выполнение запроса с обработкой ошибок и кэшированием
-   * @param {string} endpoint - Путь эндпоинта
-   * @param {Object} body - Тело запроса
-   * @param {Object} options - Настройки запроса
-   * @returns {Object} Ответ API
-   */
   request(endpoint, body = {}, options = {}) {
-    const { useCache = true, retries = 3 } = options;
+    const { useCache = true, retries = 3, logSize = false } = options;
     const cacheKey = this.cache.key(endpoint, body);
     
-    // Проверяем кэш
     if (useCache) {
       const cached = this.cache.get(cacheKey);
       if (cached) {
@@ -137,7 +155,6 @@ class OzonClient {
     
     for (let attempt = 1; attempt <= retries; attempt++) {
       try {
-        // Rate limiting
         this._throttle();
         
         const url = this.baseUrl + endpoint;
@@ -155,7 +172,12 @@ class OzonClient {
         const code = response.getResponseCode();
         const content = response.getContentText();
         
-        // Rate limit
+        // Лог размера ответа (для отладки FBS)
+        if (logSize && attempt === 1) {
+          const sizeKB = Math.round(content.length / 1024);
+          Logger.log(`📏 Размер ответа: ${sizeKB} KB`);
+        }
+        
         if (code === 429) {
           const waitTime = 2000 * Math.pow(2, attempt);
           Logger.log(`⏳ Рейт-лимит, ждём ${waitTime}ms`);
@@ -163,15 +185,12 @@ class OzonClient {
           continue;
         }
         
-        // Ошибка
         if (code !== 200) {
-          throw new Error(`HTTP ${code}: ${content}`);
+          throw new Error(`HTTP ${code}: ${content.substring(0, 200)}`);
         }
         
-        // Парсим ответ
         const data = JSON.parse(content);
         
-        // Сохраняем в кэш
         if (useCache && data) {
           this.cache.set(cacheKey, data);
         }
@@ -192,9 +211,6 @@ class OzonClient {
     throw lastError || new Error('Max retries exceeded');
   }
   
-  /**
-   * Rate limiting - не более 50 запросов в секунду
-   */
   _throttle() {
     const now = Date.now();
     const minInterval = 1000 / this.rateLimit;
@@ -215,22 +231,14 @@ class OzonLogger {
     this.sheet = sheet;
   }
   
-  /**
-   * Обновление статуса в строке 3
-   */
   status(text, color = '#FFF3CD') {
     try {
       this.sheet.getRange('A3').setValue(`🔄 ${text}`);
       this.sheet.getRange('A3').setBackground(color);
       SpreadsheetApp.flush();
-    } catch(e) {
-      // Игнорируем ошибки статуса
-    }
+    } catch(e) {}
   }
   
-  /**
-   * Обновление прогресса
-   */
   progress(step, total, text = '') {
     try {
       const percent = Math.round((step / total) * 100);
@@ -240,14 +248,9 @@ class OzonLogger {
         this.sheet.getRange('C3').setValue(text);
       }
       SpreadsheetApp.flush();
-    } catch(e) {
-      // Игнорируем ошибки прогресса
-    }
+    } catch(e) {}
   }
   
-  /**
-   * Завершение с успехом
-   */
   finish(text, color = '#D4EDDA') {
     try {
       this.sheet.getRange('A3').setValue(`✅ ${text}`);
@@ -255,22 +258,15 @@ class OzonLogger {
       this.sheet.getRange('B3').setValue('✅ Завершено');
       this.sheet.getRange('C3').setValue(new Date().toLocaleTimeString());
       SpreadsheetApp.flush();
-    } catch(e) {
-      // Игнорируем ошибки финиша
-    }
+    } catch(e) {}
   }
   
-  /**
-   * Ошибка
-   */
   error(text) {
     try {
       this.sheet.getRange('A3').setValue(`❌ ${text}`);
       this.sheet.getRange('A3').setBackground('#F8D7DA');
       SpreadsheetApp.flush();
-    } catch(e) {
-      // Игнорируем ошибки
-    }
+    } catch(e) {}
   }
 }
 
@@ -278,17 +274,38 @@ class OzonLogger {
 // 6. УТИЛИТЫ
 // ============================================================
 
+function formatDateOzon(date, end_of_day) {
+  if (!date || isNaN(date.getTime())) return '';
+  
+  var d = new Date(date);
+  
+  if (end_of_day) {
+    d.setHours(23, 59, 59, 999);
+  } else {
+    d.setHours(0, 0, 0, 0);
+  }
+  
+  var offset = 3;
+  var offset_str = '+' + String(offset).padStart(2, '0') + ':00';
+  
+  var year = d.getFullYear();
+  var month = String(d.getMonth() + 1).padStart(2, '0');
+  var day = String(d.getDate()).padStart(2, '0');
+  var hours = String(d.getHours()).padStart(2, '0');
+  var minutes = String(d.getMinutes()).padStart(2, '0');
+  var seconds = String(d.getSeconds()).padStart(2, '0');
+  
+  return year + '-' + month + '-' + day + 'T' + hours + ':' + minutes + ':' + seconds + offset_str;
+}
+
 function formatDate(date) {
   if (!date || isNaN(date.getTime())) return '';
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, '0');
-  const d = String(date.getDate()).padStart(2, '0');
-  return `${y}-${m}-${d}`;
+  return formatDateOzon(date, false);
 }
 
 function safeNum(v) {
   if (v === undefined || v === null || v === '') return 0;
-  const n = Number(v);
+  var n = Number(v);
   return isNaN(n) ? 0 : n;
 }
 
@@ -298,113 +315,175 @@ function safeStr(v) {
 }
 
 // ============================================================
-// 7. ЗАГРУЗКА ЗАКАЗОВ (FBS + FBO)
+// 7. ЗАГРУЗКА ЗАКАЗОВ (FBS ПО ДНЯМ + FBO ОБЫЧНАЯ)
 // ============================================================
 
 function fetchOzonOrders(client, dateFrom, dateTo) {
   Logger.log('📊 Загружаем заказы...');
-  const orders = {};
+  var orders = {};
+  var limit = 50;
   
-  // === FBS ЗАКАЗЫ ===
+  var actual_to = new Date(dateTo);
+  actual_to.setDate(actual_to.getDate() - 1);
+  
+  Logger.log('  📅 Период: ' + formatDateOzon(dateFrom, false) + ' - ' + formatDateOzon(actual_to, true));
+  
+  // === FBS ЗАКАЗЫ (ПО ДНЯМ - чтобы не упасть) ===
   try {
-    Logger.log('  📦 FBS...');
-    const fbsData = client.request('/v3/posting/fbs/list', {
-      filter: {
-        since: formatDate(dateFrom),
-        to: formatDate(dateTo)
-      },
-      limit: 100,
-      offset: 0,
-      with: {
-        analytics_data: true,
-        financial_data: true
+    Logger.log('  📦 FBS (по дням)...');
+    var current_date = new Date(dateFrom);
+    var end_date = new Date(actual_to);
+    var total_fbs = 0;
+    var days_processed = 0;
+    
+    while (current_date <= end_date) {
+      var day_start = new Date(current_date);
+      day_start.setHours(0, 0, 0, 0);
+      
+      var day_end = new Date(current_date);
+      day_end.setHours(23, 59, 59, 999);
+      
+      var since = formatDateOzon(day_start, false);
+      var to = formatDateOzon(day_end, true);
+      
+      var offset = 0;
+      var has_more = true;
+      var day_orders = 0;
+      
+      while (has_more) {
+        // ВАЖНО: logSize=true чтобы видеть размер ответа в логах
+        var fbsData = client.request('/v3/posting/fbs/list', {
+          filter: {
+            since: since,
+            to: to
+          },
+          limit: limit,
+          offset: offset
+        }, { useCache: false, retries: 3, logSize: true });
+        
+        var postings = fbsData.result?.postings || [];
+        total_fbs += postings.length;
+        day_orders += postings.length;
+        
+        if (postings.length === 0) break;
+        
+        postings.forEach(function(posting) {
+          if (posting.status === 'cancelled') return;
+          (posting.products || []).forEach(function(product) {
+            var sku = product.sku;
+            var offerId = product.offer_id || '';
+            if (!sku) return;
+            
+            if (!orders[sku]) {
+              orders[sku] = {
+                sku: sku,
+                offerId: offerId,
+                name: product.name || '',
+                orders: 0,
+                qty: 0,
+                fbs: 0,
+                fbo: 0,
+                sum: 0
+              };
+            }
+            orders[sku].orders++;
+            orders[sku].qty += (product.quantity || 0);
+            orders[sku].fbs++;
+            if (product.price && product.price.amount) {
+              orders[sku].sum += Number(product.price.amount) * (product.quantity || 0);
+            }
+          });
+        });
+        
+        has_more = fbsData.result?.has_next || false;
+        offset += limit;
       }
-    });
+      
+      days_processed++;
+      Logger.log(`    📅 День ${days_processed}: ${day_start.getDate()}.${day_start.getMonth() + 1} - ${day_orders} заказов`);
+      
+      current_date.setDate(current_date.getDate() + 1);
+    }
     
-    const postings = fbsData.result?.postings || [];
-    postings.forEach(posting => {
-      if (posting.status === 'cancelled') return;
-      (posting.products || []).forEach(product => {
-        const sku = product.sku;
-        if (!sku) return;
-        if (!orders[sku]) {
-          orders[sku] = {
-            sku,
-            name: product.name || '',
-            orders: 0,
-            qty: 0,
-            fbs: 0,
-            fbo: 0,
-            sum: 0
-          };
-        }
-        orders[sku].orders++;
-        orders[sku].qty += (product.quantity || 0);
-        orders[sku].fbs++;
-        if (product.price?.amount) {
-          orders[sku].sum += Number(product.price.amount) * (product.quantity || 0);
-        }
-      });
-    });
-    
-    Logger.log(`  ✅ FBS: ${Object.keys(orders).length} товаров`);
+    Logger.log('    ✅ FBS: ' + total_fbs + ' заказов (' + days_processed + ' дней)');
   } catch(e) {
-    Logger.log(`  ⚠️ FBS ошибка: ${e.message}`);
+    Logger.log('    ⚠️ FBS ошибка: ' + e.message);
   }
   
-  // === FBO ЗАКАЗЫ ===
+  // === FBO ЗАКАЗЫ (как работало - всё ок) ===
   try {
     Logger.log('  📦 FBO...');
-    const fboData = client.request('/v2/posting/fbo/list', {
-      filter: {
-        since: formatDate(dateFrom),
-        to: formatDate(dateTo)
-      },
-      limit: 100,
-      offset: 0,
-      with: {
-        analytics_data: true,
-        financial_data: true
-      }
-    });
+    var since = formatDateOzon(dateFrom, false);
+    var to = formatDateOzon(actual_to, true);
+    var offset = 0;
+    var has_more = true;
+    var total_fbo = 0;
     
-    const postings = fboData.result || [];
-    postings.forEach(posting => {
-      if (posting.status === 'cancelled') return;
-      (posting.products || []).forEach(product => {
-        const sku = product.sku;
-        if (!sku) return;
-        if (!orders[sku]) {
-          orders[sku] = {
-            sku,
-            name: product.name || '',
-            orders: 0,
-            qty: 0,
-            fbs: 0,
-            fbo: 0,
-            sum: 0
-          };
-        }
-        orders[sku].orders++;
-        orders[sku].qty += (product.quantity || 0);
-        orders[sku].fbo++;
-        if (product.price) {
-          orders[sku].sum += Number(product.price) * (product.quantity || 0);
-        }
+    while (has_more) {
+      var fboData = client.request('/v2/posting/fbo/list', {
+        filter: {
+          since: since,
+          to: to
+        },
+        limit: 50,
+        offset: offset
+      }, { useCache: true, retries: 3 });
+      
+      var postings = fboData.result || [];
+      total_fbo += postings.length;
+      
+      if (postings.length === 0) break;
+      
+      postings.forEach(function(posting) {
+        if (posting.status === 'cancelled') return;
+        (posting.products || []).forEach(function(product) {
+          var sku = product.sku;
+          var offerId = product.offer_id || '';
+          if (!sku) return;
+          
+          if (!orders[sku]) {
+            orders[sku] = {
+              sku: sku,
+              offerId: offerId,
+              name: product.name || '',
+              orders: 0,
+              qty: 0,
+              fbs: 0,
+              fbo: 0,
+              sum: 0
+            };
+          }
+          orders[sku].orders++;
+          orders[sku].qty += (product.quantity || 0);
+          orders[sku].fbo++;
+          if (product.price) {
+            orders[sku].sum += Number(product.price) * (product.quantity || 0);
+          }
+        });
       });
-    });
+      
+      if (postings.length < 50) {
+        has_more = false;
+      } else {
+        offset += 50;
+      }
+      
+      if (offset % 500 === 0) {
+        Logger.log('    📄 Загружено ' + total_fbo + ' заказов...');
+      }
+    }
     
-    Logger.log(`  ✅ FBO: ${Object.keys(orders).length} товаров`);
+    Logger.log('    ✅ FBO: ' + total_fbo + ' заказов');
   } catch(e) {
-    Logger.log(`  ⚠️ FBO ошибка: ${e.message}`);
+    Logger.log('    ⚠️ FBO ошибка: ' + e.message);
   }
   
-  Logger.log(`✅ Итого: ${Object.keys(orders).length} товаров с заказами`);
+  Logger.log('✅ Итого: ' + Object.keys(orders).length + ' товаров с заказами');
   return orders;
 }
 
 // ============================================================
-// 8. ЗАГРУЗКА АРТИКУЛОВ (VENDORCODE)
+// 8. ЗАГРУЗКА АРТИКУЛОВ
 // ============================================================
 
 function fetchOzonVendorCodes(client) {
@@ -412,16 +491,19 @@ function fetchOzonVendorCodes(client) {
   const result = {};
   let cursor = '';
   let hasNext = true;
+  let page = 0;
   
   try {
     while (hasNext) {
       const data = client.request('/v3/product/list', {
-        limit: 1000,
+        limit: 100,
         cursor: cursor,
         filter: { visibility: 'ALL' }
       }, { useCache: true });
       
       const items = data.result?.items || [];
+      Logger.log(`  📄 Страница ${page + 1}: ${items.length} товаров`);
+      
       items.forEach(item => {
         if (item.sku && item.offer_id) {
           result[item.sku] = item.offer_id;
@@ -430,6 +512,7 @@ function fetchOzonVendorCodes(client) {
       
       hasNext = data.result?.has_next || false;
       cursor = data.result?.cursor || '';
+      page++;
       
       if (!hasNext || items.length === 0) break;
     }
@@ -447,14 +530,20 @@ function fetchOzonVendorCodes(client) {
 // ============================================================
 
 function fetchOzonStocks(client, skus) {
+  if (!skus || skus.length === 0) {
+    Logger.log('⚠️ Нет SKU для загрузки остатков');
+    return {};
+  }
+  
   Logger.log('📊 Загружаем остатки...');
   const result = {};
   
-  // Разбиваем на пачки по 100
   const chunks = [];
   for (let i = 0; i < skus.length; i += 100) {
     chunks.push(skus.slice(i, i + 100));
   }
+  
+  let loadedCount = 0;
   
   chunks.forEach((chunk, idx) => {
     try {
@@ -463,9 +552,10 @@ function fetchOzonStocks(client, skus) {
           sku: chunk.map(String)
         },
         limit: 100
-      });
+      }, { useCache: true, retries: 2 });
       
-      (data.items || []).forEach(item => {
+      const items = data.items || [];
+      items.forEach(item => {
         const sku = item.product_id || item.sku;
         if (!sku) return;
         
@@ -484,9 +574,10 @@ function fetchOzonStocks(client, skus) {
           fbs,
           total: fbw + fbs
         };
+        loadedCount++;
       });
       
-      Logger.log(`  ✅ Пачка ${idx + 1}/${chunks.length}: ${(data.items || []).length} товаров`);
+      Logger.log(`  ✅ Пачка ${idx + 1}/${chunks.length}: ${items.length} товаров (всего ${loadedCount})`);
     } catch(e) {
       Logger.log(`  ⚠️ Ошибка пачки ${idx + 1}: ${e.message}`);
     }
@@ -502,34 +593,48 @@ function fetchOzonStocks(client, skus) {
 
 function fetchOzonFinance(client, dateFrom, dateTo) {
   Logger.log('📊 Загружаем финансы...');
-  const result = {};
-  let page = 1;
-  let hasMore = true;
+  
+  var cacheKey = 'FINANCE:' + formatDate(dateFrom) + ':' + formatDate(dateTo);
+  var cache = new OzonCache();
+  var cached = cache.get(cacheKey);
+  
+  if (cached) {
+    Logger.log('🔷 КЭШ: финансы за период');
+    return cached;
+  }
+  
+  var actual_to = new Date(dateTo);
+  actual_to.setDate(actual_to.getDate() - 1);
+  
+  var result = {};
+  var page = 1;
+  var hasMore = true;
+  var totalPages = 0;
   
   try {
     while (hasMore) {
-      const data = client.request('/v3/finance/transaction/list', {
+      var data = client.request('/v3/finance/transaction/list', {
         filter: {
           date: {
-            from: formatDate(dateFrom),
-            to: formatDate(dateTo)
+            from: formatDateOzon(dateFrom, false),
+            to: formatDateOzon(actual_to, true)
           }
         },
         page: page,
         page_size: 100
-      }, { useCache: true });
+      }, { useCache: false, retries: 3 });
       
-      const operations = data.result?.operations || [];
+      var operations = data.result?.operations || [];
       if (operations.length === 0) break;
       
-      operations.forEach(op => {
-        const items = op.items || [];
-        const sku = items[0]?.sku;
+      operations.forEach(function(op) {
+        var items = op.items || [];
+        var sku = items[0]?.sku;
         if (!sku) return;
         
         if (!result[sku]) {
           result[sku] = {
-            sku,
+            sku: sku,
             sales: 0,
             returns: 0,
             commission: 0,
@@ -541,9 +646,9 @@ function fetchOzonFinance(client, dateFrom, dateTo) {
           };
         }
         
-        const d = result[sku];
-        const amount = Number(op.amount) || 0;
-        const type = op.type || '';
+        var d = result[sku];
+        var amount = Number(op.amount) || 0;
+        var type = op.type || '';
         
         if (type === 'orders') {
           d.sales += Math.abs(amount);
@@ -554,16 +659,22 @@ function fetchOzonFinance(client, dateFrom, dateTo) {
         }
       });
       
-      const pageCount = data.result?.page_count || 0;
+      var pageCount = data.result?.page_count || 0;
+      totalPages = pageCount;
+      
       if (page >= pageCount) hasMore = false;
       page++;
       
-      Logger.log(`  ✅ Страница ${page - 1}/${pageCount}`);
+      if (page % 10 === 0 || page === 1) {
+        Logger.log('  ✅ Страница ' + (page - 1) + ' из ' + pageCount);
+      }
     }
     
-    Logger.log(`✅ Финансы: ${Object.keys(result).length} товаров`);
+    Logger.log('✅ Финансы: ' + Object.keys(result).length + ' товаров (' + totalPages + ' страниц)');
+    cache.set(cacheKey, result);
+    
   } catch(e) {
-    Logger.log(`⚠️ Ошибка: ${e.message}`);
+    Logger.log('⚠️ Ошибка финансов: ' + e.message);
   }
   
   return result;
@@ -573,10 +684,9 @@ function fetchOzonFinance(client, dateFrom, dateTo) {
 // 11. ОБЪЕДИНЕНИЕ ДАННЫХ
 // ============================================================
 
-function mergeOzonData(orders, vendorCodes, stocks, finance) {
+function mergeOzonData(orders, stocks, finance) {
   Logger.log('📊 Объединяем данные...');
   
-  // Собираем все SKU
   const allSkus = new Set();
   Object.keys(orders).forEach(k => allSkus.add(Number(k)));
   Object.keys(stocks).forEach(k => allSkus.add(Number(k)));
@@ -591,9 +701,10 @@ function mergeOzonData(orders, vendorCodes, stocks, finance) {
   
   allSkus.forEach(sku => {
     const order = orders[sku] || {};
-    const vendorCode = vendorCodes[sku] || '';
     const stock = stocks[sku] || {};
     const fin = finance[sku] || {};
+    
+    const vendorCode = order.offerId || '';
     
     const totalRealization = fin.sales - fin.returns || 0;
     const totalQuantity = order.qty || 0;
@@ -617,8 +728,8 @@ function mergeOzonData(orders, vendorCodes, stocks, finance) {
     const marginPercent = totalRealization > 0 ? (grossMargin / totalRealization) * 100 : 0;
     
     result.push({
-      sku,
-      vendorCode,
+      sku: sku,
+      vendorCode: vendorCode,
       ordersSum: order.sum || 0,
       adCost: 0,
       drr: 0,
@@ -628,24 +739,23 @@ function mergeOzonData(orders, vendorCodes, stocks, finance) {
       fbw: stock.fbw || 0,
       fbs: stock.fbs || 0,
       totalStock: stock.total || 0,
-      shelfPrice,
+      shelfPrice: shelfPrice,
       totalSales: fin.sales || 0,
-      totalRealization,
+      totalRealization: totalRealization,
       totalQuantitySales: totalQuantity,
       totalCostPrice: 0,
-      totalLogistics,
-      totalCommission,
-      totalPenalty,
-      totalStorage,
-      totalDeduction,
-      totalAcceptance,
+      totalLogistics: totalLogistics,
+      totalCommission: totalCommission,
+      totalPenalty: totalPenalty,
+      totalStorage: totalStorage,
+      totalDeduction: totalDeduction,
+      totalAcceptance: totalAcceptance,
       totalCompensations: 0,
-      grossMargin,
-      marginPercent
+      grossMargin: grossMargin,
+      marginPercent: marginPercent
     });
   });
   
-  // Сортировка по реализации
   result.sort((a, b) => b.totalRealization - a.totalRealization);
   
   Logger.log(`✅ Объединено: ${result.length} товаров`);
@@ -696,11 +806,9 @@ function writeOzonData(sheet, data) {
     ];
   });
   
-  // Очищаем старые данные
   const lastRow = sheet.getLastRow();
   if (lastRow >= 5) sheet.deleteRows(5, lastRow - 4);
   
-  // Записываем новые
   sheet.getRange(5, 1, tableData.length, tableData[0].length).setValues(tableData);
   
   Logger.log(`✅ Записано ${tableData.length} строк`);
@@ -716,7 +824,6 @@ function runOzonCabinet(cabinetId) {
   
   Logger.log(`🚀 ===== СТАРТ: ${config.label} =====`);
   
-  // Получаем лист
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(config.sheetName);
   if (!sheet) {
     Logger.log(`❌ Лист "${config.sheetName}" не найден`);
@@ -726,7 +833,6 @@ function runOzonCabinet(cabinetId) {
   const logger = new OzonLogger(sheet);
   logger.status('Запуск...', '#FFF3CD');
   
-  // Получаем учетные данные
   const { clientId, apiKey } = OzonSecrets.getKeys(cabinetId);
   if (!clientId || !apiKey) {
     logger.error('Учетные данные не найдены!');
@@ -734,10 +840,8 @@ function runOzonCabinet(cabinetId) {
     return;
   }
   
-  // Создаем клиент
   const client = new OzonClient(clientId, apiKey);
   
-  // Получаем даты
   let dateFrom, dateTo;
   try {
     dateFrom = new Date(sheet.getRange('B2').getValue());
@@ -756,7 +860,7 @@ function runOzonCabinet(cabinetId) {
   
   Logger.log(`📅 Период: ${formatDate(dateFrom)} - ${formatDate(dateTo)}`);
   
-  const totalSteps = 5;
+  const totalSteps = 4;
   let currentStep = 0;
   
   try {
@@ -766,30 +870,24 @@ function runOzonCabinet(cabinetId) {
     logger.status(`Заказы (${currentStep}/${totalSteps})`, '#FFF3CD');
     const orders = fetchOzonOrders(client, dateFrom, dateTo);
     
-    // --- ШАГ 2: АРТИКУЛЫ ---
-    currentStep++;
-    logger.progress(currentStep, totalSteps, 'Загрузка артикулов...');
-    logger.status(`Артикулы (${currentStep}/${totalSteps})`, '#FFF3CD');
-    const vendorCodes = fetchOzonVendorCodes(client);
-    
-    // --- ШАГ 3: ОСТАТКИ ---
+    // --- ШАГ 2: ОСТАТКИ ---
     currentStep++;
     logger.progress(currentStep, totalSteps, 'Загрузка остатков...');
     logger.status(`Остатки (${currentStep}/${totalSteps})`, '#FFF3CD');
     const allSkus = Object.keys(orders).map(Number);
     const stocks = allSkus.length > 0 ? fetchOzonStocks(client, allSkus) : {};
     
-    // --- ШАГ 4: ФИНАНСЫ ---
+    // --- ШАГ 3: ФИНАНСЫ ---
     currentStep++;
     logger.progress(currentStep, totalSteps, 'Загрузка финансов...');
     logger.status(`Финансы (${currentStep}/${totalSteps})`, '#FFF3CD');
     const finance = fetchOzonFinance(client, dateFrom, dateTo);
     
-    // --- ШАГ 5: ОБЪЕДИНЕНИЕ ---
+    // --- ШАГ 4: ОБЪЕДИНЕНИЕ ---
     currentStep++;
     logger.progress(currentStep, totalSteps, 'Объединение...');
     logger.status('Объединение данных...', '#FFF3CD');
-    const merged = mergeOzonData(orders, vendorCodes, stocks, finance);
+    const merged = mergeOzonData(orders, stocks, finance);
     
     // --- ЗАПИСЬ ---
     logger.status('Запись в таблицу...', '#FFF3CD');
@@ -855,7 +953,6 @@ function _setOzonCredentials(cabinetId) {
   const config = cabinetId === 1 ? OZON_CABINETS.cab1 : OZON_CABINETS.cab2;
   const cabinetLabel = config.label;
   
-  // Client-ID
   const clientIdResponse = ui.prompt(
     `🔑 Client-ID для ${cabinetLabel}`,
     'Client-ID из Настройки → Seller API:\n\nВведите Client-ID:',
@@ -869,7 +966,6 @@ function _setOzonCredentials(cabinetId) {
     return;
   }
   
-  // API-Key
   const apiKeyResponse = ui.prompt(
     `🔑 API-Key для ${cabinetLabel}`,
     '⚠️ Сохраните ключ сразу после генерации!\n\nВведите API-Key:',
@@ -883,7 +979,6 @@ function _setOzonCredentials(cabinetId) {
     return;
   }
   
-  // Сохраняем
   OzonSecrets.setKeys(cabinetId, clientId, apiKey);
   
   ui.alert(`✅ Учетные данные для "${cabinetLabel}" сохранены!\n\n` +
@@ -922,7 +1017,7 @@ function ozonMainAll() {
 }
 
 // ============================================================
-// 16. СОЗДАНИЕ ЛИСТА ДЛЯ OZON
+// 16. СОЗДАНИЕ ЛИСТА
 // ============================================================
 
 function createOzonSheet() {
@@ -953,7 +1048,6 @@ function createOzonSheet() {
   
   const sheet = ss.insertSheet(sheetName);
   
-  // Заголовки (26 столбцов)
   const headers = [
     'SKU', 'Артикул', 'Заказы (сумма)', 'Реклама (расход)', 'DRR',
     'Клики', 'Корзина', 'CR1', 'FBW', 'FBS',
@@ -964,12 +1058,10 @@ function createOzonSheet() {
     'Маржинальность (₽)', 'Маржинальность (%)'
   ];
   
-  // Записываем заголовки в строку 4
   sheet.getRange(4, 1, 1, headers.length).setValues([headers]);
   sheet.getRange(4, 1, 1, headers.length).setBackground('#E8F4FD');
   sheet.getRange(4, 1, 1, headers.length).setFontWeight('bold');
   
-  // Настраиваем ячейки для дат (строка 2)
   const today = new Date();
   const monthAgo = new Date(today);
   monthAgo.setDate(monthAgo.getDate() - 30);
@@ -981,13 +1073,11 @@ function createOzonSheet() {
   sheet.getRange('B1').setValue('📅 Дата с:');
   sheet.getRange('C1').setValue('📅 Дата по:');
   
-  // Настраиваем ячейки для статуса (строка 3)
   sheet.getRange('A3').setValue('🔄 Готов к работе');
   sheet.getRange('A3').setBackground('#FFF3CD');
   sheet.getRange('B3').setValue('0% ░░░░░░░░░░');
   sheet.getRange('C3').setValue('Ожидание запуска');
   
-  // Автоширина колонок
   sheet.autoResizeColumns(1, headers.length);
   
   ui.alert(`✅ Лист "${sheetName}" создан!\n\n` +
